@@ -13,6 +13,10 @@ CHAT_TRACE_PATTERNS = (
     "用户提问",
     "AI回答",
     "AI 答",
+    "You said:",
+    "Claude responded:",
+    "Show more",
+    "Claude is AI",
     "这段回答",
     "这段内容",
     "copied text",
@@ -23,6 +27,7 @@ CHAT_TRACE_PATTERNS = (
 
 PLACEHOLDER_PATTERNS = (
     "此处保留",
+    "原文细节（必须按原文保留",
     "待补充",
     "占位",
     "placeholder",

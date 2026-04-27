@@ -38,6 +38,9 @@ Rules:
 17. The root heading in `heading_path[0]` should match the specific note topic and be consistent with `file_path`.
 18. For research/design inputs, the plan must preserve reusable details, not only the thesis. If knowledge units include examples, schemas, tensor shapes, formulas, numbered procedures, ablations, baselines, reviewer/supervisor questions, or safety checklists, the edit plan must allocate explicit sections or subsections for them.
 19. Do not merge question_checklist, evaluation_protocol, ablation, baseline, or implementation_constraint units into generic "Risks" or "Notes" sections. Keep them as actionable checklists or experiment plans.
+20. For long multi-turn research conversations, plan by conceptual structure, not by chat chronology. Prefer sections such as motivation, related-work boundary, method design, implementation specification, evaluation protocol, risks, and roadmap.
+21. Do not plan a raw "问题清单" from every user question. Keep only reviewer/evaluation questions that are durable; fold clarification questions into the relevant method section or discard them.
+22. Never preserve visible transcript residue such as "You said", "Claude responded", "Show more", or "原文细节（必须按原文保留，不要替换或自造）".
 
 Editing levels:
 - level_1_target_section_only: default. Update and locally reorganize only the target section. You may merge duplicate bullets, reorder paragraphs, split long prose into small subheadings, add examples/caveats, and remove old wording covered by a better version.

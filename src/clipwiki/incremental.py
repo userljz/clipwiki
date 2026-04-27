@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from clipwiki.compiler import slugify
 from clipwiki.markdown_sections import (
@@ -36,6 +36,8 @@ from clipwiki.tokens import estimate_text_tokens
 EXTRACT_CHUNK_TOKEN_BUDGET = 4000
 PLANNING_CONTEXT_CHAR_BUDGET = 6000
 MAX_KNOWLEDGE_UNITS = 120
+MAX_SECTION_REPAIR_ATTEMPTS = 3
+ProgressCallback = Callable[[str], None]
 
 
 @dataclass(slots=True)
@@ -48,7 +50,14 @@ class LLMCallStats:
     output_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    model_backend_calls: dict[str, int] = field(default_factory=dict)
+    model_cached_calls: dict[str, int] = field(default_factory=dict)
+    model_input_tokens: dict[str, int] = field(default_factory=dict)
+    model_output_tokens: dict[str, int] = field(default_factory=dict)
+    model_total_tokens: dict[str, int] = field(default_factory=dict)
+    model_estimated_cost_usd: dict[str, float] = field(default_factory=dict)
     artifact_paths: list[str] = field(default_factory=list)
+    progress_callback: ProgressCallback | None = field(default=None, repr=False, compare=False)
 
     @property
     def any_cached(self) -> bool:
@@ -56,18 +65,29 @@ class LLMCallStats:
 
     def add(self, usage: TokenUsage | None, metadata: dict[str, Any]) -> None:
         cached = bool(metadata.get("cached", False))
+        model = str(metadata.get("model") or "-")
         if cached:
             self.cached_calls += 1
+            self.model_cached_calls[model] = self.model_cached_calls.get(model, 0) + 1
         else:
             self.backend_calls += 1
+            self.model_backend_calls[model] = self.model_backend_calls.get(model, 0) + 1
         if usage is not None:
             self.input_tokens += usage.input_tokens
             self.output_tokens += usage.output_tokens
             self.total_tokens += usage.total_tokens
             self.estimated_cost_usd += usage.estimated_cost_usd
+            self.model_input_tokens[model] = self.model_input_tokens.get(model, 0) + usage.input_tokens
+            self.model_output_tokens[model] = self.model_output_tokens.get(model, 0) + usage.output_tokens
+            self.model_total_tokens[model] = self.model_total_tokens.get(model, 0) + usage.total_tokens
+            self.model_estimated_cost_usd[model] = self.model_estimated_cost_usd.get(model, 0.0) + usage.estimated_cost_usd
         artifact = metadata.get("artifact_path")
         if artifact:
             self.artifact_paths.append(str(artifact))
+
+    def report(self, message: str) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(message)
 
 
 @dataclass(slots=True)
@@ -105,23 +125,44 @@ def run_incremental_ingest(
     artifact_dir: Path | None = None,
     top_k: int = 5,
     dry_run: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> IncrementalIngestResult:
     """Run the strict incremental note maintenance pipeline."""
 
-    cleaned_content = clean_ingest_content(raw_content)
-    if not cleaned_content.strip():
-        return IncrementalIngestResult(status="skipped", decision="skip", reason="Input file is empty")
-
     cheap_stage_model = cheap_model or model
     strong_stage_model = strong_model or model
-    llm_stats = LLMCallStats()
+    llm_stats = LLMCallStats(progress_callback=progress_callback)
+    llm_stats.report("确定性清理输入内容")
+    deterministic_content = clean_ingest_content(raw_content)
+    if not deterministic_content.strip():
+        return IncrementalIngestResult(status="skipped", decision="skip", reason="Input file is empty")
+
+    cleaned_content = deterministic_content
+    if cheap_stage_model and (_should_llm_clean_content(raw_content) or _should_llm_clean_content(deterministic_content)):
+        try:
+            llm_clean_payload = _clean_content_with_cheap_model(
+                cleaned_content=deterministic_content,
+                stats=llm_stats,
+                model=cheap_stage_model,
+                api_key=api_key,
+                base_url=base_url,
+                artifact_dir=artifact_dir,
+            )
+            candidate_content = str(llm_clean_payload.get("cleaned_content") or "").strip()
+            if _accept_llm_cleaned_content(deterministic_content, candidate_content, llm_clean_payload):
+                cleaned_content = candidate_content
+            else:
+                llm_stats.report("cheap 清洗结果风险较高，使用确定性清理结果继续")
+        except RuntimeError:
+            llm_stats.report("cheap 清洗失败，使用确定性清理结果继续")
+
     language_instruction = _language_instruction(cleaned_content)
     note_profile = _classify_note_profile(
         cleaned_content=cleaned_content,
         user_question=user_question or "",
         language_instruction=language_instruction,
         stats=llm_stats,
-        model=strong_stage_model,
+        model=cheap_stage_model,
         api_key=api_key,
         base_url=base_url,
         artifact_dir=artifact_dir,
@@ -138,17 +179,46 @@ def run_incremental_ingest(
         base_url=base_url,
         artifact_dir=artifact_dir,
     )
-    knowledge_units = _deduplicate_knowledge_units(
+    extracted_units = [
+        unit
+        for unit in _list(extract_payload.get("knowledge_units"))
+        if isinstance(unit, dict) and bool(unit.get("should_keep", True))
+    ]
+    heuristic_units = (
         [
-            *[
-                unit
-                for unit in _list(extract_payload.get("knowledge_units"))
-                if isinstance(unit, dict) and bool(unit.get("should_keep", True))
-            ],
-            *(_heuristic_research_question_units(cleaned_content) if _is_research_deep_dive(note_profile) else []),
-            *(_heuristic_research_detail_units(cleaned_content) if _is_research_deep_dive(note_profile) else []),
+            *_heuristic_research_question_units(cleaned_content),
+            *_heuristic_research_detail_units(cleaned_content),
         ]
+        if _is_research_deep_dive(note_profile)
+        else []
     )
+    if _should_synthesize_research_units(cleaned_content, note_profile, extracted_units):
+        try:
+            extract_payload = _synthesize_knowledge_units(
+                cleaned_content=cleaned_content,
+                user_question=user_question or "",
+                extracted_payload=extract_payload,
+                heuristic_units=heuristic_units,
+                language_instruction=language_instruction,
+                detail_instruction=detail_instruction,
+                stats=llm_stats,
+                model=cheap_stage_model,
+                api_key=api_key,
+                base_url=base_url,
+                artifact_dir=artifact_dir,
+            )
+            knowledge_units = _deduplicate_knowledge_units(
+                [
+                    unit
+                    for unit in _list(extract_payload.get("knowledge_units"))
+                    if isinstance(unit, dict) and bool(unit.get("should_keep", True))
+                ]
+            )
+        except RuntimeError:
+            llm_stats.report("综合长对话知识单元失败，使用抽取结果继续")
+            knowledge_units = _deduplicate_knowledge_units([*extracted_units, *heuristic_units])
+    else:
+        knowledge_units = _deduplicate_knowledge_units([*extracted_units, *heuristic_units])
     if not knowledge_units:
         return IncrementalIngestResult(
             status="skipped",
@@ -157,7 +227,9 @@ def run_incremental_ingest(
             llm_stats=llm_stats,
         )
 
+    llm_stats.report("加载笔记索引")
     index_payload = load_or_build_note_index(notes_root)
+    llm_stats.report(f"召回候选章节 top_k={top_k}")
     candidates = retrieve_candidate_sections(index_payload, knowledge_units, top_k=top_k)
     plan_payload = _complete_json(
         task_name="clipwiki-plan-note-update",
@@ -172,7 +244,7 @@ def run_incremental_ingest(
             detail_instruction=detail_instruction,
         ),
         stats=llm_stats,
-        model=strong_stage_model,
+        model=cheap_stage_model,
         api_key=api_key,
         base_url=base_url,
         artifact_dir=artifact_dir,
@@ -198,6 +270,7 @@ def run_incremental_ingest(
     target = _resolve_target(notes_root, plan, knowledge_units, title_hint=title_hint, category_hint=category_hint)
     original_markdown = target.file_path.read_text(encoding="utf-8") if target.file_path.exists() else ""
     original_section, neighbor_context = _target_section_context(original_markdown, target)
+    validation_warnings: list[str] = []
     editor_payload = _complete_json(
         task_name="clipwiki-edit-section",
         prompt=render_prompt(
@@ -230,48 +303,23 @@ def run_incremental_ingest(
             knowledge_units=knowledge_units,
         )
 
-    local_validation = validate_updated_section(
-        original_section.content,
-        updated_section,
-        expected_heading_path=original_section.heading_path,
+    updated_section, local_validation = _repair_section_until_valid(
+        updated_section=updated_section,
+        original_section=original_section,
+        neighbor_context=neighbor_context,
+        plan=plan,
+        knowledge_units=knowledge_units,
+        language_instruction=language_instruction,
+        detail_instruction=detail_instruction,
+        stats=llm_stats,
+        model=strong_stage_model,
+        api_key=api_key,
+        base_url=base_url,
+        artifact_dir=artifact_dir,
         check_append=target.existed and plan["decision"] == "update_existing_section",
     )
     if not local_validation.valid:
-        retry_payload = _retry_edit_section(
-            original_section=original_section,
-            neighbor_context=neighbor_context,
-            plan=plan,
-            knowledge_units=knowledge_units,
-            issues=local_validation.issues,
-            language_instruction=language_instruction,
-            detail_instruction=detail_instruction,
-            stats=llm_stats,
-            model=strong_stage_model,
-            api_key=api_key,
-            base_url=base_url,
-            artifact_dir=artifact_dir,
-        )
-        updated_section = _ensure_section_heading(
-            str(retry_payload.get("updated_section_markdown") or updated_section),
-            original_section,
-        )
-        updated_section = normalize_generated_markdown(updated_section)
-        local_validation = validate_updated_section(
-            original_section.content,
-            updated_section,
-            expected_heading_path=original_section.heading_path,
-            check_append=target.existed and plan["decision"] == "update_existing_section",
-        )
-        if not local_validation.valid:
-            return IncrementalIngestResult(
-                status="failed",
-                decision=plan["decision"],
-                reason="Local validation failed",
-                note_path=target.file_path,
-                validation_issues=local_validation.issues,
-                llm_stats=llm_stats,
-                knowledge_units=knowledge_units,
-            )
+        validation_warnings.extend(local_validation.issues)
 
     validator_payload = _complete_json(
         task_name="clipwiki-validate-note-update",
@@ -308,91 +356,96 @@ def run_incremental_ingest(
             api_key=api_key,
             base_url=base_url,
             artifact_dir=artifact_dir,
+            current_section_markdown=updated_section,
         )
         updated_section = _ensure_section_heading(
             str(retry_payload.get("updated_section_markdown") or updated_section),
             original_section,
         )
         updated_section = normalize_generated_markdown(updated_section)
-        local_validation = validate_updated_section(
-            original_section.content,
-            updated_section,
-            expected_heading_path=original_section.heading_path,
-            check_append=target.existed and plan["decision"] == "update_existing_section",
-        )
-        if not local_validation.valid:
-            return IncrementalIngestResult(
-                status="failed",
-                decision=plan["decision"],
-                reason="Retry local validation failed",
-                note_path=target.file_path,
-                validation_issues=local_validation.issues,
-                llm_stats=llm_stats,
-                knowledge_units=knowledge_units,
-            )
-        validator_payload = _complete_json(
-            task_name="clipwiki-validate-note-update-retry",
-            prompt=render_prompt(
-                "validate_note_update.md",
-                original_section=original_section.content,
-                updated_section=updated_section,
-                edit_plan_json=_json(plan),
-                knowledge_units_json=_json(knowledge_units),
-                language_instruction=language_instruction,
-                detail_instruction=detail_instruction,
-            ),
+        updated_section, local_validation = _repair_section_until_valid(
+            updated_section=updated_section,
+            original_section=original_section,
+            neighbor_context=neighbor_context,
+            plan=plan,
+            knowledge_units=knowledge_units,
+            language_instruction=language_instruction,
+            detail_instruction=detail_instruction,
             stats=llm_stats,
-            model=cheap_stage_model,
+            model=strong_stage_model,
             api_key=api_key,
             base_url=base_url,
             artifact_dir=artifact_dir,
+            check_append=target.existed and plan["decision"] == "update_existing_section",
         )
-        if validator_payload.get("valid") is False:
-            retry_issues = [
-                str(issue.get("description") or issue)
-                for issue in _list(validator_payload.get("issues"))
-            ]
-            return IncrementalIngestResult(
-                status="failed",
-                decision=plan["decision"],
-                reason=str(validator_payload.get("reason") or "LLM validation failed after retry"),
-                note_path=target.file_path,
-                validation_issues=retry_issues,
-                llm_stats=llm_stats,
-                knowledge_units=knowledge_units,
+        if not local_validation.valid:
+            validation_warnings.extend(local_validation.issues)
+        else:
+            validator_payload = _complete_json(
+                task_name="clipwiki-validate-note-update-retry",
+                prompt=render_prompt(
+                    "validate_note_update.md",
+                    original_section=original_section.content,
+                    updated_section=updated_section,
+                    edit_plan_json=_json(plan),
+                    knowledge_units_json=_json(knowledge_units),
+                    language_instruction=language_instruction,
+                    detail_instruction=detail_instruction,
+                ),
+                stats=llm_stats,
+                model=cheap_stage_model,
+                api_key=api_key,
+                base_url=base_url,
+                artifact_dir=artifact_dir,
             )
+            if validator_payload.get("valid") is False:
+                retry_issues = [
+                    str(issue.get("description") or issue)
+                    for issue in _list(validator_payload.get("issues"))
+                ]
+                validation_warnings.extend(retry_issues)
 
     new_markdown = _apply_target_update(original_markdown, original_section, updated_section, target)
     diff = _diff(original_markdown, new_markdown, fromfile=f"{target.file_path} (before)", tofile=f"{target.file_path} (after)")
     title = title_from_markdown(new_markdown, fallback=target.file_path.stem)
+    validation_warnings = _dedupe_strings(validation_warnings)
+    reason = str(plan.get("reason", ""))
+    if validation_warnings:
+        reason = _append_reason_suffix(
+            reason,
+            f"Wrote best-effort note with validation warnings after {MAX_SECTION_REPAIR_ATTEMPTS} repair attempts.",
+        )
     if dry_run:
         return IncrementalIngestResult(
             status="dry_run",
             decision=plan["decision"],
-            reason=str(plan.get("reason", "")),
+            reason=reason,
             note_path=target.file_path,
             title=title,
             category=target.file_path.parent.name,
             tags=_tags_from_units(knowledge_units),
             markdown=new_markdown,
             diff=diff,
+            validation_issues=validation_warnings,
             llm_stats=llm_stats,
             knowledge_units=knowledge_units,
         )
 
     target.file_path.parent.mkdir(parents=True, exist_ok=True)
+    llm_stats.report("写入 Markdown 笔记并刷新索引")
     target.file_path.write_text(new_markdown, encoding="utf-8")
     build_note_index(notes_root)
     return IncrementalIngestResult(
         status="updated" if target.existed else "created",
         decision=plan["decision"],
-        reason=str(plan.get("reason", "")),
+        reason=reason,
         note_path=target.file_path,
         title=title,
         category=target.file_path.parent.name,
         tags=_tags_from_units(knowledge_units),
         markdown=new_markdown,
         diff=diff,
+        validation_issues=validation_warnings,
         llm_stats=llm_stats,
         knowledge_units=knowledge_units,
     )
@@ -404,6 +457,7 @@ def clean_ingest_content(raw_content: str) -> str:
     lines = raw_content.replace("\r\n", "\n").splitlines()
     cleaned: list[str] = []
     blank_seen = False
+    previous_normalized = ""
     noise_prefixes = ("share", "copy", "regenerate", "thumbs up", "thumbs down")
     in_code = False
     for line in lines:
@@ -415,14 +469,96 @@ def clean_ingest_content(raw_content: str) -> str:
             continue
         if not in_code and stripped.lower() in noise_prefixes:
             continue
+        if not in_code and _is_chat_export_noise_line(stripped):
+            continue
+        if not in_code:
+            line = _strip_chat_speaker_prefix(line)
+            stripped = line.strip()
+            if not stripped:
+                continue
         if not stripped:
             if not blank_seen:
                 cleaned.append("")
             blank_seen = True
             continue
+        normalized = " ".join(stripped.split()).lower()
+        if not in_code and normalized == previous_normalized:
+            continue
         cleaned.append(line.rstrip())
+        previous_normalized = normalized
         blank_seen = False
     return "\n".join(cleaned).strip()
+
+
+def _is_chat_export_noise_line(stripped: str) -> bool:
+    lowered = stripped.lower()
+    if not stripped:
+        return False
+    if lowered in {"show more", "claude is ai and can make mistakes. please double-check responses."}:
+        return True
+    if re.fullmatch(r"\d{1,2}:\d{2}", stripped):
+        return True
+    if stripped in {"分类整理相关工作并识别关键缺失文献。", "搜寻相关研究并评估创新性。", "评估了想法新颖性，设计了完整的记忆管理流程。"}:
+        return True
+    return False
+
+
+def _strip_chat_speaker_prefix(line: str) -> str:
+    stripped = line.lstrip()
+    indent = line[: len(line) - len(stripped)]
+    for prefix in ("You said:", "Claude responded:"):
+        if stripped.startswith(prefix):
+            return indent + stripped.removeprefix(prefix).strip()
+    return line
+
+
+def _should_llm_clean_content(content: str) -> bool:
+    lowered = content.lower()
+    if any(marker in lowered for marker in ("you said:", "claude responded:", "show more", "chatgpt said:", "assistant responded:")):
+        return True
+    return estimate_text_tokens(content) > EXTRACT_CHUNK_TOKEN_BUDGET
+
+
+def _clean_content_with_cheap_model(
+    *,
+    cleaned_content: str,
+    stats: LLMCallStats,
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+    artifact_dir: Path | None,
+) -> dict[str, Any]:
+    return _complete_json(
+        task_name="clipwiki-clean-ingest-content",
+        prompt=render_prompt(
+            "clean_ingest_content.md",
+            raw_content=cleaned_content,
+            language_instruction=_language_instruction(cleaned_content),
+        ),
+        stats=stats,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        artifact_dir=artifact_dir,
+    )
+
+
+def _accept_llm_cleaned_content(original: str, candidate: str, payload: dict[str, Any]) -> bool:
+    if not candidate:
+        return False
+    if str(payload.get("risk_level") or "").strip().lower() == "high":
+        return False
+    original_nonspace = len("".join(original.split()))
+    candidate_nonspace = len("".join(candidate.split()))
+    if original_nonspace > 1200 and candidate_nonspace < original_nonspace * 0.35:
+        return False
+    protected_markers = ("```", "####", "arxiv", "http://", "https://")
+    original_lower = original.lower()
+    candidate_lower = candidate.lower()
+    for marker in protected_markers:
+        if original_lower.count(marker) > candidate_lower.count(marker):
+            return False
+    return True
 
 
 def _extract_knowledge_units(
@@ -483,6 +619,74 @@ def _extract_knowledge_units(
         "knowledge_units": units,
         "discarded_content": discarded,
     }
+
+
+def _should_synthesize_research_units(content: str, note_profile: dict[str, Any], units: list[dict[str, Any]]) -> bool:
+    return _is_research_deep_dive(note_profile) and (len(_content_chunks(content)) > 1 or len(units) > 45)
+
+
+def _synthesize_knowledge_units(
+    *,
+    cleaned_content: str,
+    user_question: str,
+    extracted_payload: dict[str, Any],
+    heuristic_units: list[dict[str, Any]],
+    language_instruction: str,
+    detail_instruction: str,
+    stats: LLMCallStats,
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+    artifact_dir: Path | None,
+) -> dict[str, Any]:
+    payload = _complete_json(
+        task_name="clipwiki-synthesize-knowledge-units",
+        prompt=render_prompt(
+            "synthesize_knowledge_units.md",
+            user_question=user_question,
+            source_context=_planning_source_context(cleaned_content, str(extracted_payload.get("content_summary") or ""), char_budget=2500),
+            extracted_units_json=_json(_compact_units_for_synthesis(_list(extracted_payload.get("knowledge_units")), limit=50)),
+            heuristic_units_json=_json(_compact_units_for_synthesis(heuristic_units, limit=10)),
+            language_instruction=language_instruction,
+            detail_instruction=detail_instruction,
+        ),
+        stats=stats,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        artifact_dir=artifact_dir,
+    )
+    return {
+        "content_summary": str(payload.get("content_summary") or extracted_payload.get("content_summary") or ""),
+        "knowledge_units": _list(payload.get("knowledge_units")),
+        "discarded_content": [
+            *_list(extracted_payload.get("discarded_content")),
+            *_list(payload.get("discarded_content")),
+        ],
+    }
+
+
+def _compact_units_for_synthesis(units: list[object], *, limit: int) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        claim = " ".join(str(unit.get("claim", "")).split())
+        if not claim:
+            continue
+        compacted.append(
+            {
+                "claim": claim[:500],
+                "type": str(unit.get("type") or ""),
+                "detail_role": str(unit.get("detail_role") or ""),
+                "preserve_as": str(unit.get("preserve_as") or ""),
+                "possible_topics": _string_list(unit.get("possible_topics"))[:3],
+                "keywords": _string_list(unit.get("keywords"))[:6],
+            }
+        )
+        if len(compacted) >= limit:
+            break
+    return compacted
 
 
 def _classify_note_profile(
@@ -625,6 +829,8 @@ def _heuristic_research_question_units(content: str, *, limit: int = 40) -> list
         question = _clean_question_line(line)
         if question is None:
             continue
+        if not _is_durable_research_question(question):
+            continue
         key = question.lower()
         if key in seen:
             continue
@@ -684,6 +890,8 @@ def _iter_research_detail_snippets(content: str) -> list[tuple[str, str, str]]:
         stripped = line.strip()
         if not stripped:
             continue
+        if _is_source_residue_detail(stripped):
+            continue
         if any(marker in stripped for marker in ("比如", "例如", "示例")) and len(stripped) <= 280:
             snippets.append(("example", "bullet", stripped))
 
@@ -704,6 +912,8 @@ def _iter_research_detail_snippets(content: str) -> list[tuple[str, str, str]]:
     for line in lines:
         stripped = line.strip()
         lowered = stripped.lower()
+        if _is_source_residue_detail(stripped):
+            continue
         if any(token in lowered for token in ("shape", "hidden states", "logprob", "teacher forcing", "input:", "output:", "mlp:", "transformer:", "pooling:", "d_z")):
             snippets.append(("implementation_constraint", "bullet", stripped))
     return snippets
@@ -732,6 +942,8 @@ def _looks_like_top_level_cn_heading(line: str) -> bool:
 
 def _clean_question_line(line: str) -> str | None:
     cleaned = line.strip()
+    cleaned = cleaned.removeprefix("You said:").strip()
+    cleaned = cleaned.removeprefix("Claude responded:").strip()
     cleaned = cleaned.lstrip("-*•●○0123456789. ）)、\t ").strip()
     if not cleaned:
         return None
@@ -743,6 +955,66 @@ def _clean_question_line(line: str) -> str | None:
     if any(marker in lowered for marker in ("http://", "https://", "```")):
         return None
     return cleaned
+
+
+def _is_durable_research_question(question: str) -> bool:
+    lowered = question.lower()
+    chat_markers = (
+        "给我",
+        "你回答",
+        "你的 prompt",
+        "代码块",
+        "复制",
+        "show more",
+        "claude",
+        "cursor",
+        "aider",
+        "你说",
+        "你的意思",
+        "我没懂",
+        "我有个问题",
+        "好了",
+    )
+    if any(marker in lowered for marker in chat_markers):
+        return False
+    durable_markers = (
+        "如何证明",
+        "怎么证明",
+        "如何验证",
+        "怎么验证",
+        "是否",
+        "能否",
+        "该不该",
+        "什么时候",
+        "存什么",
+        "插入什么",
+        "怎么设计",
+        "怎么获得",
+        "为什么",
+        "能成功",
+        "风险",
+        "baseline",
+        "ablation",
+        "benchmark",
+        "评审",
+        "reviewer",
+        "failure mode",
+        "hypothesis",
+    )
+    return any(marker in lowered for marker in durable_markers)
+
+
+def _is_source_residue_detail(text: str) -> bool:
+    lowered = text.lower()
+    residue_markers = (
+        "原文细节（必须按原文保留",
+        "此处保留",
+        "you said:",
+        "claude responded:",
+        "show more",
+        "claude is ai",
+    )
+    return any(marker in lowered for marker in residue_markers)
 
 
 def _planning_source_context(content: str, summary: str, *, char_budget: int = PLANNING_CONTEXT_CHAR_BUDGET) -> str:
@@ -829,6 +1101,7 @@ def _complete_json(
     base_url: str | None,
     artifact_dir: Path | None,
 ) -> dict[str, Any]:
+    stats.report(_progress_label(task_name))
     runtime = LiteLLMRuntime(
         task_name=task_name,
         model=model,
@@ -837,8 +1110,88 @@ def _complete_json(
         artifact_dir=artifact_dir,
     )
     parsed, usage, metadata = runtime.complete_json(prompt)
+    metadata.setdefault("model", model or "-")
     stats.add(usage, metadata)
     return parsed
+
+
+def _progress_label(task_name: str) -> str:
+    if task_name == "clipwiki-clean-ingest-content":
+        return "cheap 模型清洗输入内容"
+    if task_name == "clipwiki-classify-note-mode":
+        return "判断笔记类型"
+    if task_name.startswith("clipwiki-extract-knowledge-units"):
+        suffix = task_name.removeprefix("clipwiki-extract-knowledge-units").strip("-")
+        return f"抽取知识单元 {suffix}" if suffix else "抽取知识单元"
+    if task_name == "clipwiki-synthesize-knowledge-units":
+        return "综合长对话知识单元"
+    if task_name == "clipwiki-plan-note-update":
+        return "规划写入位置和目标章节"
+    if task_name == "clipwiki-edit-section":
+        return "生成或编辑目标章节"
+    if task_name.startswith("clipwiki-edit-section-repair"):
+        suffix = task_name.removeprefix("clipwiki-edit-section-repair").strip("-")
+        return f"修复校验问题 {suffix}" if suffix else "修复校验问题"
+    if task_name.startswith("clipwiki-validate-note-update"):
+        return "校验笔记更新质量"
+    return task_name
+
+
+def _repair_section_until_valid(
+    *,
+    updated_section: str,
+    original_section: MarkdownSection,
+    neighbor_context: str,
+    plan: dict[str, Any],
+    knowledge_units: list[dict[str, Any]],
+    language_instruction: str,
+    detail_instruction: str,
+    stats: LLMCallStats,
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+    artifact_dir: Path | None,
+    check_append: bool,
+) -> tuple[str, Any]:
+    """Ask the editor model to repair validation failures for a few bounded rounds."""
+
+    local_validation = validate_updated_section(
+        original_section.content,
+        updated_section,
+        expected_heading_path=original_section.heading_path,
+        check_append=check_append,
+    )
+    for attempt in range(1, MAX_SECTION_REPAIR_ATTEMPTS + 1):
+        if local_validation.valid:
+            return updated_section, local_validation
+        retry_payload = _retry_edit_section(
+            original_section=original_section,
+            neighbor_context=neighbor_context,
+            plan=plan,
+            knowledge_units=knowledge_units,
+            issues=local_validation.issues,
+            language_instruction=language_instruction,
+            detail_instruction=detail_instruction,
+            stats=stats,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            artifact_dir=artifact_dir,
+            current_section_markdown=updated_section,
+            attempt=attempt,
+        )
+        updated_section = _ensure_section_heading(
+            str(retry_payload.get("updated_section_markdown") or updated_section),
+            original_section,
+        )
+        updated_section = normalize_generated_markdown(updated_section)
+        local_validation = validate_updated_section(
+            original_section.content,
+            updated_section,
+            expected_heading_path=original_section.heading_path,
+            check_append=check_append,
+        )
+    return updated_section, local_validation
 
 
 def _retry_edit_section(
@@ -855,21 +1208,26 @@ def _retry_edit_section(
     api_key: str | None,
     base_url: str | None,
     artifact_dir: Path | None,
+    current_section_markdown: str | None = None,
+    attempt: int = 1,
 ) -> dict[str, Any]:
     retry_plan = {
         **plan,
         "validation_feedback": issues,
+        "previous_invalid_section_markdown": current_section_markdown or "",
         "retry_instruction": (
-            "Revise the target section to fix these validation issues. "
-            "Return only the corrected full target section. Do not add raw chat, duplicate headings, duplicate paragraphs, or append-only chunks."
+            "Revise the previous invalid target section to fix every validation issue listed in validation_feedback. "
+            "Return only the corrected full target section. Keep the same root heading and preserve the useful knowledge. "
+            "For Markdown lint failures: surround every heading and list with blank lines, use four spaces for nested list items, "
+            "avoid placeholder text, avoid duplicate headings/paragraphs, and do not append raw chat or append-only chunks."
         ),
     }
     return _complete_json(
-        task_name="clipwiki-edit-section-retry",
+        task_name=f"clipwiki-edit-section-repair-{attempt:02d}",
         prompt=render_prompt(
             "edit_section.md",
             neighbor_context=neighbor_context,
-            target_section=original_section.content,
+            target_section=current_section_markdown or original_section.content,
             edit_plan_json=_json(retry_plan),
             knowledge_units_json=_json(knowledge_units),
             language_instruction=language_instruction,
@@ -1063,6 +1421,23 @@ def _string_list(value: object) -> list[str]:
 
 def _list(value: object) -> list[object]:
     return value if isinstance(value, list) else []
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def _append_reason_suffix(reason: str, suffix: str) -> str:
+    reason = reason.strip()
+    return f"{reason} {suffix}" if reason else suffix
 
 
 def _json(value: object) -> str:

@@ -161,14 +161,12 @@ class LiteLLMRuntime:
                     )
                 content = response.choices[0].message.content or ""
                 parsed = _extract_json_dict(content)
-                try:
-                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                        estimated_cost_usd = float(completion_cost(completion_response=response) or 0.0)
-                except Exception:  # pragma: no cover - depends on provider-specific pricing support
-                    estimated_cost_usd = 0.0
+                input_tokens = int(getattr(response.usage, "prompt_tokens", 0) or 0)
+                output_tokens = int(getattr(response.usage, "completion_tokens", 0) or 0)
+                estimated_cost_usd = _actual_completion_cost_usd(response)
                 usage = TokenUsage(
-                    input_tokens=int(getattr(response.usage, "prompt_tokens", 0) or 0),
-                    output_tokens=int(getattr(response.usage, "completion_tokens", 0) or 0),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                     estimated_cost_usd=estimated_cost_usd,
                 )
                 record = {
@@ -213,6 +211,51 @@ class LiteLLMRuntime:
         }
         artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return str(artifact_path)
+
+
+def _actual_completion_cost_usd(response: Any) -> float:
+    provider_cost = _cost_from_response_usage(response)
+    if provider_cost > 0:
+        return provider_cost
+    hidden_cost = _cost_from_hidden_params(response)
+    if hidden_cost > 0:
+        return hidden_cost
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return float(completion_cost(completion_response=response) or 0.0)
+    except Exception:  # pragma: no cover - provider/model pricing coverage varies
+        return 0.0
+
+
+def _cost_from_response_usage(response: Any) -> float:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0.0
+    for field_name in ("cost", "total_cost", "estimated_cost", "estimated_cost_usd"):
+        value = getattr(usage, field_name, None)
+        if value is None and isinstance(usage, dict):
+            value = usage.get(field_name)
+        try:
+            numeric = float(value or 0.0)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        if numeric > 0:
+            return numeric
+    return 0.0
+
+
+def _cost_from_hidden_params(response: Any) -> float:
+    hidden = getattr(response, "_hidden_params", None)
+    if not isinstance(hidden, dict):
+        return 0.0
+    for field_name in ("response_cost", "cost"):
+        try:
+            numeric = float(hidden.get(field_name) or 0.0)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        if numeric > 0:
+            return numeric
+    return 0.0
 
 
 def _extract_json_dict(text: str) -> dict[str, Any]:

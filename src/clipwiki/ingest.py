@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import markdown as markdown_lib
 
@@ -20,6 +20,7 @@ from clipwiki.wiki_maintenance import record_ingest_event
 DEFAULT_NOTES_DIR = Path("clipwiki-notes")
 DEFAULT_HTML_DIR = Path("clipwiki-html")
 DEFAULT_INBOX_DIR = Path("clipwiki-inbox")
+ProgressCallback = Callable[[str], None]
 
 
 @dataclass(slots=True)
@@ -39,6 +40,12 @@ class ClipWikiIngestResult:
     llm_output_tokens: int = 0
     llm_total_tokens: int = 0
     llm_estimated_cost_usd: float = 0.0
+    llm_model_backend_calls: dict[str, int] | None = None
+    llm_model_cached_calls: dict[str, int] | None = None
+    llm_model_input_tokens: dict[str, int] | None = None
+    llm_model_output_tokens: dict[str, int] | None = None
+    llm_model_total_tokens: dict[str, int] | None = None
+    llm_model_estimated_cost_usd: dict[str, float] | None = None
     pruned_empty_notes: int = 0
     pruned_duplicate_notes: int = 0
     pruned_orphan_html_pages: int = 0
@@ -64,15 +71,18 @@ def ingest_web_ai_result(
     api_key: str | None = None,
     base_url: str | None = None,
     artifact_dir: Path | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> ClipWikiIngestResult:
     """Organize copied AI output into a Markdown note and matching HTML page."""
 
+    _report_progress(progress_callback, "读取输入文件")
     raw_text = input_path.read_text(encoding="utf-8")
     if not raw_text.strip():
         raise ValueError(
             f"ClipWiki ingest input is empty: {input_path}. "
             "Paste the copied AI answer into this file before running ingest."
         )
+    _report_progress(progress_callback, "清理旧的空笔记、重复笔记和孤立 HTML")
     pruned_empty_notes = prune_empty_notes(notes_dir, html_dir=html_dir)
     pruned_duplicate_notes = prune_duplicate_notes(notes_dir, html_dir=html_dir)
     pruned_orphan_html_pages = prune_orphan_html_pages(notes_dir, html_dir=html_dir)
@@ -95,11 +105,13 @@ def ingest_web_ai_result(
         api_key=api_key,
         base_url=base_url,
         artifact_dir=artifact_dir,
+        progress_callback=progress_callback,
     )
     incremental.pruned_empty_notes += pruned_empty_notes
 
     html_path: Path | None = None
     if incremental.status in {"created", "updated"} and incremental.note_path is not None and incremental.markdown is not None:
+        _report_progress(progress_callback, "渲染 HTML 页面和索引")
         html_path = _html_path_for_note(incremental.note_path, notes_dir=notes_dir, html_dir=html_dir)
         html_path.parent.mkdir(parents=True, exist_ok=True)
         html_path.write_text(
@@ -127,6 +139,12 @@ def ingest_web_ai_result(
         llm_output_tokens=incremental.llm_stats.output_tokens,
         llm_total_tokens=incremental.llm_stats.total_tokens,
         llm_estimated_cost_usd=incremental.llm_stats.estimated_cost_usd,
+        llm_model_backend_calls=dict(incremental.llm_stats.model_backend_calls),
+        llm_model_cached_calls=dict(incremental.llm_stats.model_cached_calls),
+        llm_model_input_tokens=dict(incremental.llm_stats.model_input_tokens),
+        llm_model_output_tokens=dict(incremental.llm_stats.model_output_tokens),
+        llm_model_total_tokens=dict(incremental.llm_stats.model_total_tokens),
+        llm_model_estimated_cost_usd=dict(incremental.llm_stats.model_estimated_cost_usd),
         pruned_empty_notes=incremental.pruned_empty_notes,
         pruned_duplicate_notes=pruned_duplicate_notes,
         pruned_orphan_html_pages=pruned_orphan_html_pages,
@@ -136,6 +154,7 @@ def ingest_web_ai_result(
         validation_issues=incremental.validation_issues,
     )
     if result.status in {"created", "updated", "skipped", "failed"}:
+        _report_progress(progress_callback, "记录变更日志和维护索引")
         record_ingest_event(
             notes_dir,
             status=result.status,
@@ -147,7 +166,13 @@ def ingest_web_ai_result(
             llm_total_tokens=result.llm_total_tokens,
             llm_estimated_cost_usd=result.llm_estimated_cost_usd,
         )
+    _report_progress(progress_callback, "完成")
     return result
+
+
+def _report_progress(progress_callback: ProgressCallback | None, message: str) -> None:
+    if progress_callback is not None:
+        progress_callback(message)
 
 
 def prune_empty_notes(notes_dir: Path, *, html_dir: Path | None = None) -> int:

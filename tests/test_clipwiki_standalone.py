@@ -4,7 +4,8 @@ from typer.testing import CliRunner
 
 from clipwiki.cli import app
 from clipwiki.ingest import ingest_web_ai_result, prune_orphan_html_pages, render_note_html
-from clipwiki.incremental import run_incremental_ingest
+from clipwiki.incremental import clean_ingest_content, run_incremental_ingest
+from clipwiki.llm import _actual_completion_cost_usd
 from clipwiki.markdown_normalization import normalize_generated_markdown
 from clipwiki.note_index import load_or_build_note_index, memory_dir, retrieve_candidate_sections
 from clipwiki.schemas import TokenUsage
@@ -39,6 +40,51 @@ def test_chinese_retrieval(tmp_path: Path) -> None:
     payload = load_or_build_note_index(notes)
     hits = retrieve_candidate_sections(payload, [{"claim": "GUI Agent 使用技能进行多动作预测", "keywords": ["技能", "多动作"], "possible_topics": ["GUI 代理"]}])
     assert hits
+
+
+def test_actual_cost_prefers_provider_usage_cost() -> None:
+    class Usage:
+        prompt_tokens = 10
+        completion_tokens = 5
+        cost = 0.123
+
+    class Response:
+        usage = Usage()
+
+    assert _actual_completion_cost_usd(Response()) == 0.123
+
+
+def test_actual_cost_uses_hidden_response_cost() -> None:
+    class Usage:
+        prompt_tokens = 10
+        completion_tokens = 5
+
+    class Response:
+        usage = Usage()
+        _hidden_params = {"response_cost": 0.456}
+
+    assert _actual_completion_cost_usd(Response()) == 0.456
+
+
+def test_clean_ingest_content_removes_chat_export_wrappers() -> None:
+    raw = """You said: 你给我分析一下这个方法？
+16:36
+Claude responded: 结论是这个方法可以作为研究假设。
+搜寻相关研究并评估创新性。
+搜寻相关研究并评估创新性。
+Show more
+Claude is AI and can make mistakes. Please double-check responses.
+"""
+
+    cleaned = clean_ingest_content(raw)
+
+    assert "You said:" not in cleaned
+    assert "Claude responded:" not in cleaned
+    assert "16:36" not in cleaned
+    assert "Show more" not in cleaned
+    assert "搜寻相关研究并评估创新性" not in cleaned
+    assert "你给我分析一下这个方法？" in cleaned
+    assert "结论是这个方法可以作为研究假设。" in cleaned
 
 
 def test_render_note_html_uses_markdown_library_for_code_tables_and_math(tmp_path: Path) -> None:
@@ -135,9 +181,19 @@ def test_validation_uses_pymarkdown_for_python_markdown_list_indent() -> None:
     assert any(issue.startswith("markdown_lint:PML101") for issue in result.issues)
 
 
+def test_validation_does_not_block_on_nonsemantic_markdown_lint_rules() -> None:
+    result = validate_updated_section(
+        "",
+        "# Demo\n## Heading Without Blank Line\n" + ("这是一行很长但语义正确的中文技术说明。" * 8) + "\n",
+    )
+
+    assert not any("MD013" in issue or "MD022" in issue or "MD032" in issue for issue in result.issues)
+
+
 def test_incremental_ingest_routes_cheap_and_strong_models(tmp_path: Path, monkeypatch) -> None:
     calls: list[tuple[str, str | None]] = []
     prompts: list[str] = []
+    progress: list[str] = []
     responses = [
         {
             "note_mode": "research_deep_dive",
@@ -201,13 +257,14 @@ def test_incremental_ingest_routes_cheap_and_strong_models(tmp_path: Path, monke
         notes_root=tmp_path / "notes",
         cheap_model="cheap-model",
         strong_model="strong-model",
+        progress_callback=progress.append,
     )
 
     assert result.status == "created"
     assert calls == [
-        ("clipwiki-classify-note-mode", "strong-model"),
+        ("clipwiki-classify-note-mode", "cheap-model"),
         ("clipwiki-extract-knowledge-units", "cheap-model"),
-        ("clipwiki-plan-note-update", "strong-model"),
+        ("clipwiki-plan-note-update", "cheap-model"),
         ("clipwiki-edit-section", "strong-model"),
         ("clipwiki-validate-note-update", "cheap-model"),
     ]
@@ -221,6 +278,151 @@ def test_incremental_ingest_routes_cheap_and_strong_models(tmp_path: Path, monke
     assert "detail_sections_to_preserve" in prompts[2]
     assert "Do not compress 10 specific questions into 2 generic risk bullets" in prompts[3]
     assert "must not collapse concrete reusable details" in prompts[4]
+    assert result.llm_stats.model_backend_calls == {"cheap-model": 4, "strong-model": 1}
+    assert result.llm_stats.model_total_tokens == {"cheap-model": 8, "strong-model": 2}
+    assert "判断笔记类型" in progress
+    assert "抽取知识单元" in progress
+    assert "规划写入位置和目标章节" in progress
+
+
+def test_incremental_ingest_uses_cheap_model_for_llm_cleaning(tmp_path: Path, monkeypatch) -> None:
+    calls: list[tuple[str, str | None]] = []
+    prompts: list[str] = []
+    responses = [
+        {
+            "cleaned_content": "这是一个需要保留的技术结论。",
+            "discarded_content": [{"text_or_summary": "chat wrappers", "reason": "UI noise"}],
+            "risk_level": "low",
+            "risk_reason": "Only wrappers removed.",
+        },
+        {
+            "note_mode": "howto_reference",
+            "should_preserve_source_details": False,
+            "detail_policy": "Keep practical details.",
+            "reason": "Short technical note.",
+        },
+        {
+            "content_summary": "Cheap cleaning.",
+            "knowledge_units": [
+                {
+                    "id": "ku_1",
+                    "claim": "ClipWiki can clean copied chat wrappers with the cheap model.",
+                    "type": "method",
+                    "keywords": ["cleaning", "cheap model"],
+                    "possible_topics": ["Cheap Model Cleaning"],
+                    "should_keep": True,
+                    "novelty_hint": "new",
+                    "reason": "Useful pipeline behavior.",
+                }
+            ],
+            "discarded_content": [],
+        },
+        {
+            "decision": "create_new_file",
+            "reason": "New cleaning note.",
+            "duplicate_check": {"is_duplicate": False},
+            "target": {"file_path": "clipwiki/cheap-cleaning.md", "heading_path": ["Cheap Model Cleaning"], "operation": "replace_section"},
+            "edit_intent": {},
+            "required_context": {"need_full_file": False, "need_sections": []},
+        },
+        {"changed": True, "updated_section_markdown": "# Cheap Model Cleaning\n\nCheap cleaning removes wrappers before extraction."},
+        {"valid": True, "reason": "ok", "issues": [], "requires_retry": False},
+    ]
+
+    def fake_complete_json(self, prompt: str):
+        prompts.append(prompt)
+        calls.append((self.task_name, self.model))
+        return responses.pop(0), TokenUsage(input_tokens=1, output_tokens=1), {"artifact_path": None}
+
+    monkeypatch.setattr("clipwiki.incremental.LiteLLMRuntime.complete_json", fake_complete_json)
+
+    result = run_incremental_ingest(
+        raw_content="You said: 这是一个需要保留的技术结论。\n12:30\nClaude responded: 好的。",
+        source_path=tmp_path / "source.txt",
+        notes_root=tmp_path / "notes",
+        cheap_model="cheap-model",
+        strong_model="strong-model",
+    )
+
+    assert result.status == "created"
+    assert calls == [
+        ("clipwiki-clean-ingest-content", "cheap-model"),
+        ("clipwiki-classify-note-mode", "cheap-model"),
+        ("clipwiki-extract-knowledge-units", "cheap-model"),
+        ("clipwiki-plan-note-update", "cheap-model"),
+        ("clipwiki-edit-section", "strong-model"),
+        ("clipwiki-validate-note-update", "cheap-model"),
+    ]
+    assert "这是一个需要保留的技术结论" in prompts[1]
+    assert "You said:" not in prompts[1]
+
+
+def test_incremental_ingest_falls_back_when_synthesis_times_out(tmp_path: Path, monkeypatch) -> None:
+    calls: list[str] = []
+    progress: list[str] = []
+    units = [
+        {
+            "id": f"ku_{index}",
+            "claim": f"Research detail {index} should remain usable after synthesis fallback.",
+            "type": "method",
+            "keywords": ["research", "fallback"],
+            "possible_topics": ["Synthesis Fallback"],
+            "detail_role": "algorithm_step",
+            "preserve_as": "bullet",
+            "should_keep": True,
+            "novelty_hint": "new",
+            "reason": "Useful detail.",
+        }
+        for index in range(46)
+    ]
+    responses = {
+        "clipwiki-classify-note-mode": {
+            "note_mode": "research_deep_dive",
+            "should_preserve_source_details": True,
+            "detail_policy": "Preserve research details.",
+            "reason": "Research proposal.",
+        },
+        "clipwiki-extract-knowledge-units": {
+            "content_summary": "Many research units.",
+            "knowledge_units": units,
+            "discarded_content": [],
+        },
+        "clipwiki-plan-note-update": {
+            "decision": "create_new_file",
+            "reason": "New fallback note.",
+            "duplicate_check": {"is_duplicate": False},
+            "target": {"file_path": "clipwiki/synthesis-fallback.md", "heading_path": ["Synthesis Fallback"], "operation": "replace_section"},
+            "edit_intent": {},
+            "required_context": {"need_full_file": False, "need_sections": []},
+        },
+        "clipwiki-edit-section": {
+            "changed": True,
+            "updated_section_markdown": "# Synthesis Fallback\n\nResearch details continue without synthesized units.",
+        },
+        "clipwiki-validate-note-update": {"valid": True, "reason": "ok", "issues": [], "requires_retry": False},
+    }
+
+    def fake_complete_json(self, prompt: str):
+        calls.append(self.task_name)
+        if self.task_name == "clipwiki-synthesize-knowledge-units":
+            raise RuntimeError("timeout")
+        return responses[self.task_name], TokenUsage(input_tokens=1, output_tokens=1), {"artifact_path": None}
+
+    monkeypatch.setattr("clipwiki.incremental.LiteLLMRuntime.complete_json", fake_complete_json)
+
+    result = run_incremental_ingest(
+        raw_content="这是一个 research proposal，需要保留很多 algorithm steps 和 ablation details。",
+        source_path=tmp_path / "source.txt",
+        notes_root=tmp_path / "notes",
+        cheap_model="cheap-model",
+        strong_model="strong-model",
+        progress_callback=progress.append,
+    )
+
+    assert result.status == "created"
+    assert "clipwiki-synthesize-knowledge-units" in calls
+    assert "综合长对话知识单元失败，使用抽取结果继续" in progress
+    assert result.knowledge_units[0]["claim"].startswith("Research detail")
 
 
 def test_troubleshooting_mode_does_not_inject_research_verbatim_details(tmp_path: Path, monkeypatch) -> None:
@@ -282,8 +484,127 @@ def test_troubleshooting_mode_does_not_inject_research_verbatim_details(tmp_path
 
     assert result.status == "created"
     assert "Troubleshooting/runbook mode is ON" in prompts[1]
-    assert "原文细节（必须按原文保留" not in prompts[2]
+    assert "heuristic_detail" not in prompts[2]
+    assert '"possible_topics": ["原文可复用细节"]' not in prompts[2]
     assert "此处保留" not in (result.markdown or "")
+
+
+def test_incremental_ingest_repairs_local_validation_failures_until_valid(tmp_path: Path, monkeypatch) -> None:
+    calls: list[str] = []
+    responses = [
+        {
+            "note_mode": "howto_reference",
+            "should_preserve_source_details": False,
+            "detail_policy": "Keep the fix.",
+            "reason": "How-to note.",
+        },
+        {
+            "content_summary": "Repair invalid Markdown.",
+            "knowledge_units": [
+                {
+                    "id": "ku_1",
+                    "claim": "ClipWiki should repair invalid generated Markdown before giving up.",
+                    "type": "method",
+                    "keywords": ["clipwiki", "repair"],
+                    "possible_topics": ["ClipWiki Repair"],
+                    "should_keep": True,
+                    "novelty_hint": "new",
+                    "reason": "Prevents empty failed ingests.",
+                }
+            ],
+            "discarded_content": [],
+        },
+        {
+            "decision": "create_new_file",
+            "reason": "New repair note.",
+            "duplicate_check": {"is_duplicate": False},
+            "target": {"file_path": "clipwiki/repair.md", "heading_path": ["ClipWiki Repair"], "operation": "replace_section"},
+            "edit_intent": {},
+            "required_context": {"need_full_file": False, "need_sections": []},
+        },
+        {"changed": True, "updated_section_markdown": "# ClipWiki Repair\n\n- 此处保留原文示例内容"},
+        {"changed": True, "updated_section_markdown": "# ClipWiki Repair\n\n- TODO"},
+        {"changed": True, "updated_section_markdown": "# ClipWiki Repair\n\nClipWiki repairs invalid generated Markdown before writing notes."},
+        {"valid": True, "reason": "ok", "issues": [], "requires_retry": False},
+    ]
+
+    def fake_complete_json(self, prompt: str):
+        calls.append(self.task_name)
+        return responses.pop(0), TokenUsage(input_tokens=1, output_tokens=1), {"artifact_path": None}
+
+    monkeypatch.setattr("clipwiki.incremental.LiteLLMRuntime.complete_json", fake_complete_json)
+
+    result = run_incremental_ingest(
+        raw_content="ClipWiki 需要在本地校验失败后继续把错误交给 LLM 修复。",
+        source_path=tmp_path / "source.txt",
+        notes_root=tmp_path / "notes",
+        cheap_model="cheap-model",
+        strong_model="strong-model",
+    )
+
+    assert result.status == "created"
+    assert "clipwiki-edit-section-repair-01" in calls
+    assert "clipwiki-edit-section-repair-02" in calls
+    assert "TODO" not in (result.markdown or "")
+    assert "此处保留" not in (result.markdown or "")
+
+
+def test_incremental_ingest_writes_best_effort_after_repair_attempts(tmp_path: Path, monkeypatch) -> None:
+    responses = [
+        {
+            "note_mode": "howto_reference",
+            "should_preserve_source_details": False,
+            "detail_policy": "Keep the note.",
+            "reason": "How-to note.",
+        },
+        {
+            "content_summary": "Best-effort write.",
+            "knowledge_units": [
+                {
+                    "id": "ku_1",
+                    "claim": "ClipWiki writes the best available note after bounded repair attempts.",
+                    "type": "method",
+                    "keywords": ["clipwiki", "best-effort"],
+                    "possible_topics": ["ClipWiki Best Effort"],
+                    "should_keep": True,
+                    "novelty_hint": "new",
+                    "reason": "Avoids empty outputs.",
+                }
+            ],
+            "discarded_content": [],
+        },
+        {
+            "decision": "create_new_file",
+            "reason": "New best-effort note.",
+            "duplicate_check": {"is_duplicate": False},
+            "target": {"file_path": "clipwiki/best-effort.md", "heading_path": ["ClipWiki Best Effort"], "operation": "replace_section"},
+            "edit_intent": {},
+            "required_context": {"need_full_file": False, "need_sections": []},
+        },
+        {"changed": True, "updated_section_markdown": "# ClipWiki Best Effort\n\n- TODO"},
+        {"changed": True, "updated_section_markdown": "# ClipWiki Best Effort\n\n- TODO"},
+        {"changed": True, "updated_section_markdown": "# ClipWiki Best Effort\n\n- TODO"},
+        {"changed": True, "updated_section_markdown": "# ClipWiki Best Effort\n\n- TODO"},
+        {"valid": True, "reason": "ok", "issues": [], "requires_retry": False},
+    ]
+
+    def fake_complete_json(self, prompt: str):
+        return responses.pop(0), TokenUsage(input_tokens=1, output_tokens=1), {"artifact_path": None}
+
+    monkeypatch.setattr("clipwiki.incremental.LiteLLMRuntime.complete_json", fake_complete_json)
+
+    result = run_incremental_ingest(
+        raw_content="ClipWiki 需要在多次修复失败后也写出最佳版本。",
+        source_path=tmp_path / "source.txt",
+        notes_root=tmp_path / "notes",
+        cheap_model="cheap-model",
+        strong_model="strong-model",
+    )
+
+    assert result.status == "created"
+    assert result.note_path is not None and result.note_path.exists()
+    assert result.validation_issues
+    assert "best-effort" in result.reason
 
 
 def test_validation_rejects_placeholder_text() -> None:
@@ -294,6 +615,16 @@ def test_validation_rejects_placeholder_text() -> None:
 
     assert not result.valid
     assert any(issue.startswith("placeholder_text") for issue in result.issues)
+
+
+def test_validation_rejects_chat_export_residue() -> None:
+    result = validate_updated_section(
+        "",
+        "# Latent Policy Memory\n\nYou said: 我有个问题。\n\nClaude responded: 下面分析。",
+    )
+
+    assert not result.valid
+    assert any(issue.startswith("chat_trace") for issue in result.issues)
 
 
 def test_wikilink_graph_resolves_titles_paths_and_broken_links(tmp_path: Path) -> None:

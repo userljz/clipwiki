@@ -31,7 +31,7 @@ Hard rules:
 - Do not rewrite unrelated sections.
 - Do not append raw content.
 - Do not keep chat format.
-- Do not mention "the AI answer", "the user asked", "new content", or "copied text".
+- Do not mention "the AI answer", "the user asked", "new content", "copied text", "You said", "Claude responded", or "Show more".
 - Do not add heavy metadata.
 - Do not duplicate existing points.
 - Preserve useful existing content.
@@ -42,6 +42,8 @@ Hard rules:
 - Keep concrete details such as examples, JSON schemas, tensor shapes, hyperparameters, formulas, named baselines, numbered steps, and supervisor/reviewer questions unless they are clearly duplicate or wrong.
 - A good research note is allowed to be longer than a summary. Do not compress 10 specific questions into 2 generic risk bullets.
 - Do not invent, substitute, or "improve" examples. If a knowledge unit says "原文细节（必须按原文保留，不要替换或自造）", preserve that example/schema/shape/structure faithfully and do not replace it with a different medical case.
+- Do not include the phrase "原文细节（必须按原文保留，不要替换或自造）" in the visible note. Integrate the actual detail into normal prose, a checklist, a schema, or code block.
+- For long research conversations, write a coherent research note organized by concept and decision. Do not create a catch-all section that dumps every user clarification question.
 - For troubleshooting/runbook notes, write a practical runbook: symptoms, root cause, diagnostic commands, fixes, verification, and caveats. Do not include source-transcript residue, full tracebacks, or "原文可复用细节示例" sections.
 - Forbidden in every note: placeholder text such as "此处保留原文示例内容", "此处保留原文示例内容与命令片段", "待补充", "TODO", "placeholder", "insert command here", or equivalent filler. If exact content is unavailable, omit the bullet rather than writing a placeholder.
 - Markdown formatting rules:

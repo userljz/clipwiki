@@ -13,6 +13,7 @@ PAREN_VARIABLE_RE = re.compile(r"(?<!\\)\(([A-Za-z])\)")
 PROTECTED_INLINE_RE = re.compile(r"(`[^`]*`|\$\$.*?\$\$|\$[^$\n]+\$|\\\(.*?\\\))")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 UNORDERED_BULLET_RE = re.compile(r"^(\s*)([-*+]\s+)(.*)$")
+PYMARKDOWN_BLOCKING_RULES = frozenset({"PML101"})
 
 MATH_VARIABLES = frozenset("pkmnqxyzabcdLNK")
 MATH_CONTEXT_KEYWORDS = (
@@ -176,13 +177,15 @@ def _pymarkdown_lint_issues(markdown: str) -> list[str]:
     except PyMarkdownApiException as exc:
         return [f"markdown_lint_error:{exc}"]
 
-    return [
-        (
+    issues: list[str] = []
+    for failure in scan_result.scan_failures:
+        if str(failure.rule_id).upper() not in PYMARKDOWN_BLOCKING_RULES:
+            continue
+        issues.append(
             f"markdown_lint:{failure.rule_id}:line {failure.line_number}:"
             f"{failure.rule_description}{failure.extra_error_information}"
         )
-        for failure in scan_result.scan_failures
-    ]
+    return issues
 
 
 def _flat_parent_list_issues(markdown: str) -> list[str]:

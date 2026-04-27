@@ -50,22 +50,25 @@ def ingest_command(
 ) -> None:
     notes_dir = _resolve_user_path(notes)
     html_dir = _resolve_user_path(html)
-    result = ingest_web_ai_result(
-        _resolve_user_path(source),
-        notes_dir=notes_dir,
-        html_dir=html_dir,
-        user_question=question,
-        category_hint=category,
-        title_hint=title,
-        top_k=top_k,
-        dry_run=dry_run,
-        model=model,
-        cheap_model=cheap_model,
-        strong_model=strong_model,
-        api_key=api_key,
-        base_url=base_url,
-        artifact_dir=notes_dir / ".clipwiki" / "llm-artifacts",
-    )
+    console = Console()
+    with console.status("ClipWiki 准备开始...", spinner="dots") as status:
+        result = ingest_web_ai_result(
+            _resolve_user_path(source),
+            notes_dir=notes_dir,
+            html_dir=html_dir,
+            user_question=question,
+            category_hint=category,
+            title_hint=title,
+            top_k=top_k,
+            dry_run=dry_run,
+            model=model,
+            cheap_model=cheap_model,
+            strong_model=strong_model,
+            api_key=api_key,
+            base_url=base_url,
+            artifact_dir=notes_dir / ".clipwiki" / "llm-artifacts",
+            progress_callback=lambda message: status.update(f"ClipWiki: {message}"),
+        )
     table_title = "ClipWiki Ingest Dry Run" if result.status == "dry_run" else "ClipWiki Ingest Complete"
     if result.status == "skipped":
         table_title = "ClipWiki Ingest Skipped"
@@ -98,8 +101,51 @@ def ingest_command(
     table.add_row("LLM output tokens", str(result.llm_output_tokens))
     table.add_row("LLM total tokens", str(result.llm_total_tokens))
     table.add_row("LLM estimated cost", f"${result.llm_estimated_cost_usd:.6f}")
+    cheap_model_name = cheap_model or base_model
+    strong_model_name = strong_model or base_model
+    if cheap_model_name != "-":
+        table.add_row(
+            "Cheap model backend calls",
+            _model_usage_value(result, cheap_model_name, field="backend_calls"),
+        )
+        table.add_row(
+            "Cheap model tokens",
+            _model_usage_value(result, cheap_model_name, field="tokens"),
+        )
+        table.add_row(
+            "Cheap model estimated cost",
+            _model_usage_value(result, cheap_model_name, field="cost"),
+        )
+    if strong_model_name != "-" and strong_model_name != cheap_model_name:
+        table.add_row(
+            "Strong model backend calls",
+            _model_usage_value(result, strong_model_name, field="backend_calls"),
+        )
+        table.add_row(
+            "Strong model tokens",
+            _model_usage_value(result, strong_model_name, field="tokens"),
+        )
+        table.add_row(
+            "Strong model estimated cost",
+            _model_usage_value(result, strong_model_name, field="cost"),
+        )
     table.add_row("LLM artifact", result.artifact_path or "-")
-    Console().print(table)
+    console.print(table)
+
+
+def _model_usage_value(result, model_name: str, *, field: str) -> str:
+    if field == "backend_calls":
+        backend = (result.llm_model_backend_calls or {}).get(model_name, 0)
+        cached = (result.llm_model_cached_calls or {}).get(model_name, 0)
+        return f"{backend} backend, {cached} cached"
+    if field == "tokens":
+        total = (result.llm_model_total_tokens or {}).get(model_name, 0)
+        input_tokens = (result.llm_model_input_tokens or {}).get(model_name, 0)
+        output_tokens = (result.llm_model_output_tokens or {}).get(model_name, 0)
+        return f"{total} total ({input_tokens} in / {output_tokens} out)"
+    if field == "cost":
+        return f"${(result.llm_model_estimated_cost_usd or {}).get(model_name, 0.0):.6f}"
+    return "-"
 
 
 @app.command("build")

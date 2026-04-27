@@ -13,6 +13,7 @@ Do not preserve chat style.
 Do not include trivial greetings, acknowledgements, or purely social content.
 Do not discard a point merely because it was written as dialogue; if it changes the final understanding, keep it.
 Favor recall over compression. For dense research/design conversations, extract enough units to reconstruct the main argument and final method, not just a short abstract.
+Remove transcript wrappers such as "You said", "Claude responded", "Show more", timestamps, repeated browsing/status summaries, and model disclaimers.
 
 Language policy:
 <LANGUAGE_INSTRUCTION>
@@ -52,6 +53,7 @@ For troubleshooting/runbook or how-to inputs, discard:
 - placeholder instructions
 
 Forbidden in all modes: never output placeholder-like claims such as "此处保留原文示例内容", "待补充", "TODO", "placeholder", or "insert command here". If a command or snippet is not present in the source, do not invent a placeholder for it.
+Also forbidden: never output visible meta-preservation labels such as "原文细节（必须按原文保留，不要替换或自造）". If the detail matters, rewrite it as normal durable knowledge without that label.
 
 Input:
 <USER_QUESTION>
