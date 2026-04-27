@@ -9,21 +9,27 @@ cd clipwiki
 uv sync --extra llm
 ```
 
+本地运行目录都放在项目根目录下：
+
+- `clipwiki-inbox/`：放从网页 AI 对话复制出来的原始文本。
+- `clipwiki-notes/`：保存生成和维护后的 Markdown 笔记。
+- `clipwiki-html/`：保存同步生成的 HTML 页面。
+
 ## 生成笔记
 
 ```bash
 export LLM_API_KEY=你的key
 export LLM_MODEL=openrouter/inclusionai/ling-2.6-flash:free
 
-uv run clipwiki ingest ../wiki-memory-bench/clipwiki-inbox/test3.txt --notes ../clipwiki-notes --html ../clipwiki-html --top-k 8
+uv run clipwiki ingest clipwiki-inbox/test3.txt --notes clipwiki-notes --html clipwiki-html --top-k 8
 ```
 
 也可以使用双层模型：`cheap-model` 负责分块抽取和校验，`strong-model` 负责规划和正式编辑。
 
 ```bash
-uv run clipwiki ingest ../wiki-memory-bench/clipwiki-inbox/test3.txt \
-  --notes ../clipwiki-notes \
-  --html ../clipwiki-html \
+uv run clipwiki ingest clipwiki-inbox/test3.txt \
+  --notes clipwiki-notes \
+  --html clipwiki-html \
   --cheap-model openrouter/inclusionai/ling-2.6-flash:free \
   --strong-model openrouter/inclusionai/ling-2.6-1t:free \
   --top-k 8
@@ -38,9 +44,9 @@ uv run clipwiki ingest ../wiki-memory-bench/clipwiki-inbox/test3.txt \
 ## 构建、搜索和问答
 
 ```bash
-uv run clipwiki build ~/clipwiki-notes --wiki ~/clipwiki-vault
-uv run clipwiki search "latent policy memory" --wiki ~/clipwiki-vault --top-k 5
-uv run clipwiki ask "什么是 latent policy memory?" --wiki ~/clipwiki-vault
+uv run clipwiki build clipwiki-notes --wiki clipwiki-vault
+uv run clipwiki search "latent policy memory" --wiki clipwiki-vault --top-k 5
+uv run clipwiki ask "什么是 latent policy memory?" --wiki clipwiki-vault
 ```
 
 ## Python API
@@ -51,8 +57,8 @@ from clipwiki.ingest import ingest_web_ai_result
 
 result = ingest_web_ai_result(
     Path("clipwiki-inbox/test3.txt"),
-    notes_dir=Path.home() / "clipwiki-notes",
-    html_dir=Path.home() / "clipwiki-html",
+    notes_dir=Path("clipwiki-notes"),
+    html_dir=Path("clipwiki-html"),
     model="openrouter/inclusionai/ling-2.6-flash:free",
 )
 print(result.note_path)

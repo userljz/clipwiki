@@ -22,6 +22,7 @@ dist/
 
 # ClipWiki runtime/test outputs
 runs/
+clipwiki-inbox/
 clipwiki-notes/
 clipwiki-html/
 clipwiki-vault/
