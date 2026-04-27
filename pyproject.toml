@@ -1,0 +1,30 @@
+[project]
+name = "clipwiki"
+version = "0.1.0"
+description = "Local Markdown knowledge base maintained from copied AI conversations."
+readme = "README-CN.md"
+requires-python = ">=3.11"
+dependencies = [
+    "markdown>=3.10.2",
+    "pydantic>=2.12.5",
+    "pymarkdownlnt>=0.9.36",
+    "pymdown-extensions>=10.21.2",
+    "rich>=15.0.0",
+    "typer>=0.23.1",
+]
+
+[project.scripts]
+clipwiki = "clipwiki.cli:app"
+
+[project.optional-dependencies]
+llm = ["litellm>=1.83.10"]
+
+[dependency-groups]
+dev = ["pytest>=9.0.3"]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
