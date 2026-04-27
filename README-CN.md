@@ -5,7 +5,7 @@ ClipWiki 是一个独立的本地 Markdown 知识库工具，用来把你从 AI 
 ## 安装/运行
 
 ```bash
-cd /home/jinzeli2@amd.com/clipwiki
+cd clipwiki
 uv sync --extra llm
 ```
 
@@ -15,15 +15,15 @@ uv sync --extra llm
 export LLM_API_KEY=你的key
 export LLM_MODEL=openrouter/inclusionai/ling-2.6-flash:free
 
-uv run clipwiki ingest /home/jinzeli2@amd.com/wiki-memory-bench/clipwiki-inbox/test3.txt   --notes /home/jinzeli2@amd.com/clipwiki-notes   --html /home/jinzeli2@amd.com/clipwiki-html   --top-k 8
+uv run clipwiki ingest ../wiki-memory-bench/clipwiki-inbox/test3.txt --notes ../clipwiki-notes --html ../clipwiki-html --top-k 8
 ```
 
 也可以使用双层模型：`cheap-model` 负责分块抽取和校验，`strong-model` 负责规划和正式编辑。
 
 ```bash
-uv run clipwiki ingest /home/jinzeli2@amd.com/wiki-memory-bench/clipwiki-inbox/test3.txt \
-  --notes /home/jinzeli2@amd.com/clipwiki-notes \
-  --html /home/jinzeli2@amd.com/clipwiki-html \
+uv run clipwiki ingest ../wiki-memory-bench/clipwiki-inbox/test3.txt \
+  --notes ../clipwiki-notes \
+  --html ../clipwiki-html \
   --cheap-model openrouter/inclusionai/ling-2.6-flash:free \
   --strong-model openrouter/inclusionai/ling-2.6-1t:free \
   --top-k 8
